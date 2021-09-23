@@ -1,31 +1,46 @@
 package main.kotlin.util
 
-import java.lang.Exception
+import java.util.concurrent.Callable
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
-import kotlin.run
 
 interface Strategy {
     fun <A> invoke(f: () -> A?): () -> A?
+
+    companion object {
+        fun fromExecutorService(es: ExecutorService): Strategy =
+            object : Strategy {
+                override fun <A> invoke(a: () -> A?): () -> A? {
+                    val f = es.submit(
+                        Callable<A>(a::invoke)
+                    )
+                    return f::get
+                }
+            }
+    }
 }
 
 private class Node<A>(var a: A = null as A) : AtomicReference<Node<A>>()
 
-//note: onErrorのデフォ値がおかしそう
-open class Actor<A>(val strategy: Strategy, val handler: (A) -> Unit, val onError: (Throwable) -> Unit = throw Exception()) {
+open class Actor<A>(
+    val strategy: Strategy,
+    val handler: (A) -> Unit,
+    val onError: (Throwable) -> Unit = { throw(it) }
+) {
     private val tail = AtomicReference(Node<A>())
     private val suspended = AtomicInteger(1)
     private val head = AtomicReference(tail.get())
 
     //note: change "!"
-    fun ap(a: A): () -> A? {
+    fun invoke(a: A): () -> A? {
         val n = Node(a)
         head.getAndSet(n).lazySet(n)
         return trySchedule()
     }
 
     private fun schedule(): () -> A? {
-        return strategy.invoke{ act().invoke() }
+        return strategy.invoke { act().invoke() }
     }
 
     private fun act(): () -> A? {
@@ -44,7 +59,9 @@ open class Actor<A>(val strategy: Strategy, val handler: (A) -> Unit, val onErro
 
     private fun trySchedule(): (() -> A?) {
         return if (suspended.compareAndSet(1, 0)) schedule()
-               else {{null}}
+        else {
+            { null }
+        }
     }
 
     private fun batchHandle(t: Node<A>?, i: Int): Node<A>? {
@@ -52,14 +69,22 @@ open class Actor<A>(val strategy: Strategy, val handler: (A) -> Unit, val onErro
 
         return n?.let {
             try {
-                    handler(it.a)
+                handler(it.a)
             } catch (e: Throwable) {
-                    onError(e)
+                onError(e)
             }
             if (i > 0) {
                 batchHandle(n, i - 1)
             } else it
         } ?: run { t }
 
+    }
+
+    companion object {
+        fun <A> invoke(
+            es: ExecutorService,
+            handler: (A) -> Unit,
+            onError: (Throwable) -> Unit = { throw(it) }
+        ): Actor<A> = Actor(Strategy.fromExecutorService(es), handler, onError)
     }
 }
